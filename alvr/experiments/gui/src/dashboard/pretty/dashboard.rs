@@ -1,10 +1,12 @@
 use super::{
-    tabs::{ConnectionEvent, ConnectionPanel},
+    tabs::{ConnectionEvent, ConnectionPanel, SettingsEvent, SettingsPanel},
     theme::{ContainerStyle, ACCENT, BACKGROUND_SECONDARY, FOREGROUND},
 };
-use alvr_common::ServerEvent;
+use crate::dashboard::RequestHandler;
+use alvr_session::{ServerEvent, SessionDesc};
 use iced::{
-    button, image, Alignment, Button, Column, Container, Element, Image, Length, Row, Space, Text,
+    alignment::Horizontal, button, image, Alignment, Button, Column, Container, Element, Image,
+    Length, Row, Space, Text,
 };
 
 pub enum TabLabelStyle {
@@ -37,6 +39,7 @@ pub enum DashboardEvent {
     TabClick(usize),
     LanguageClick,
     ConnectionEvent(ConnectionEvent),
+    SettingsEvent(SettingsEvent),
 }
 
 pub struct TabState {
@@ -60,11 +63,12 @@ pub struct Dashboard {
     tab_states: Vec<TabState>,
     language_state: TabState,
     connection_panel: ConnectionPanel,
+    settings_panel: SettingsPanel,
 }
 
-impl Default for Dashboard {
-    fn default() -> Self {
-        Self {
+impl Dashboard {
+    pub fn new(session: SessionDesc, request_handler: &mut RequestHandler) -> Self {
+        let mut this = Self {
             selected_tab: 0,
             tab_states: vec![
                 TabState {
@@ -92,36 +96,62 @@ impl Default for Dashboard {
                     ..Default::default()
                 },
             ],
-            connection_panel: ConnectionPanel::default(),
             language_state: TabState {
                 display_name: "Language".into(),
                 ..Default::default()
             },
-        }
-    }
-}
+            connection_panel: ConnectionPanel::new(),
+            settings_panel: SettingsPanel::new(request_handler),
+        };
 
-impl Dashboard {
-    pub fn update(
-        &mut self,
-        event: DashboardEvent,
-        request_handler: &mut dyn FnMut(String) -> String,
-    ) {
+        this.update(
+            DashboardEvent::ServerEvent(ServerEvent::Session(session)),
+            request_handler,
+        );
+
+        this
+    }
+
+    pub fn update(&mut self, event: DashboardEvent, request_handler: &mut RequestHandler) {
         match event {
-            DashboardEvent::ServerEvent(_) => (),
+            DashboardEvent::ServerEvent(event) => match event {
+                ServerEvent::Session(session) => {
+                    self.connection_panel.update(
+                        ConnectionEvent::SessionUpdated(session.clone()),
+                        request_handler,
+                    );
+                    self.settings_panel
+                        .update(SettingsEvent::SessionUpdated(session), request_handler);
+                }
+                ServerEvent::SessionUpdated => (), // deprecated
+                ServerEvent::SessionSettingsExtrapolationFailed => todo!(),
+                ServerEvent::ClientFoundOk => todo!(),
+                ServerEvent::ClientFoundInvalid => todo!(),
+                ServerEvent::ClientFoundWrongVersion(_) => todo!(),
+                ServerEvent::ClientConnected => todo!(),
+                ServerEvent::ClientDisconnected => todo!(),
+                ServerEvent::UpdateDownloadedBytesCount(_) => todo!(),
+                ServerEvent::UpdateDownloadError => todo!(),
+                ServerEvent::Statistics(_) => todo!(),
+                ServerEvent::Raw(_) => (),
+                ServerEvent::EchoQuery(_) => todo!(),
+            },
             DashboardEvent::TabClick(tab) => self.selected_tab = tab,
             DashboardEvent::LanguageClick => (),
             DashboardEvent::ConnectionEvent(event) => {
                 self.connection_panel.update(event, request_handler)
             }
+            DashboardEvent::SettingsEvent(event) => {
+                self.settings_panel.update(event, request_handler)
+            }
         }
     }
 
     pub fn view(&mut self) -> Element<DashboardEvent> {
-        let mut sidebar_children = vec![Image::new(image::Handle::from_memory(
-            include_bytes!("../../../resources/images/favicon.png").to_vec(),
-        ))
-        .into()];
+        let mut sidebar_children = vec![Text::new("ALVR")
+            .size(20)
+            .horizontal_alignment(Horizontal::Center)
+            .into()];
 
         // work around "self.tab_states cannot be borrowed both mutably and immutably"
         let mut selected_tab_display_name = "".into();
@@ -148,6 +178,7 @@ impl Dashboard {
                 } else {
                     TabLabelStyle::Normal
                 })
+                .padding(7)
                 .on_press(DashboardEvent::TabClick(index))
                 .into(),
             );
@@ -160,6 +191,7 @@ impl Dashboard {
                 Text::new(&self.language_state.display_name),
             )
             .style(TabLabelStyle::Normal)
+            .padding(7)
             .on_press(DashboardEvent::LanguageClick)
             .into(),
         );
@@ -169,17 +201,23 @@ impl Dashboard {
                 .connection_panel
                 .view()
                 .map(DashboardEvent::ConnectionEvent),
+            2 => self
+                .settings_panel
+                .view()
+                .map(DashboardEvent::SettingsEvent),
             _ => Text::new("unimplemented").into(),
         };
 
         Container::new(Row::with_children(vec![
             Column::with_children(sidebar_children)
-                .padding(5)
-                .spacing(5)
+                .padding(10)
+                .spacing(10)
                 .align_items(Alignment::Fill)
                 .into(),
             Column::with_children(vec![
-                Text::new(selected_tab_display_name).size(30).into(),
+                Container::new(Text::new(selected_tab_display_name).size(30))
+                    .padding([10, 20])
+                    .into(),
                 content_panel,
             ])
             .width(Length::Fill)

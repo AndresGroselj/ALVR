@@ -7,3 +7,8 @@ mod terminal;
 pub use self::pretty::*;
 #[cfg(feature = "terminal")]
 pub use self::terminal::*;
+
+use alvr_session::SessionDesc;
+
+type RequestHandler = dyn FnMut(String) -> String;
+type LoadSession = dyn Fn() -> SessionDesc;
