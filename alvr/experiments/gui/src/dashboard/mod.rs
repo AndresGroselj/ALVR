@@ -8,7 +8,6 @@ pub use self::pretty::*;
 #[cfg(feature = "terminal")]
 pub use self::terminal::*;
 
-use alvr_session::SessionDesc;
+use alvr_common::StrResult;
 
-type RequestHandler = dyn FnMut(String) -> String;
-type LoadSession = dyn Fn() -> SessionDesc;
+type RequestHandler = dyn FnMut(String) -> StrResult<String>;

@@ -7,7 +7,7 @@ use iced::{
 };
 
 use crate::dashboard::{
-    pretty::theme::{ButtonStyle, ScrollableStyle, BACKGROUND_SECONDARY},
+    pretty::theme::{ButtonStyle, ScrollableStyle, ELEMENT_BACKGROUND},
     RequestHandler,
 };
 
@@ -67,13 +67,14 @@ impl ConnectionPanel {
                     .collect::<Vec<_>>();
             }
             ConnectionEvent::AddClient(hostname, ip_address) => {
-                request_handler(format!(r#"add_client("{}", "{}")"#, hostname, ip_address));
+                request_handler(format!(r#"add_client("{}", "{}")"#, hostname, ip_address))
+                    .unwrap();
             }
             ConnectionEvent::TrustClient(hostname) => {
-                request_handler(format!(r#"trust_client("{}")"#, hostname));
+                request_handler(format!(r#"trust_client("{}")"#, hostname)).unwrap();
             }
             ConnectionEvent::RemoveClient(hostname) => {
-                request_handler(format!(r#"remove_client("{}")"#, hostname));
+                request_handler(format!(r#"remove_client("{}")"#, hostname)).unwrap();
             }
         }
     }
@@ -82,7 +83,7 @@ impl ConnectionPanel {
         let mut scrollable = Scrollable::new(&mut self.scrollable_state)
             .style(ScrollableStyle)
             .spacing(10)
-            .padding(10);
+            .padding(15);
 
         scrollable = scrollable.push(Text::new("New clients").size(20));
 
@@ -149,7 +150,7 @@ struct ClientCardStyle;
 impl container::StyleSheet for ClientCardStyle {
     fn style(&self) -> container::Style {
         container::Style {
-            background: BACKGROUND_SECONDARY.into(),
+            background: ELEMENT_BACKGROUND.into(),
             border_radius: 10.0,
             ..Default::default()
         }

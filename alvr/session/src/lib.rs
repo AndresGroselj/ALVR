@@ -68,6 +68,7 @@ pub struct OpenvrConfig {
     pub latency_target: u64,
     pub latency_use_frametime: bool,
     pub latency_target_maximum: u64,
+    pub latency_target_offset: i32,
     pub latency_threshold: u64,
     pub bitrate_up_rate: u64,
     pub bitrate_down_rate: u64,
@@ -113,6 +114,7 @@ pub struct OpenvrConfig {
     pub saturation: f32,
     pub gamma: f32,
     pub sharpening: f32,
+    pub enable_fec: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -592,7 +594,8 @@ impl DerefMut for SessionLock<'_> {
 impl Drop for SessionLock<'_> {
     fn drop(&mut self) {
         save_session(self.session_desc, self.session_path).unwrap();
-        log_event(ServerEvent::SessionUpdated);
+        log_event(ServerEvent::SessionUpdated); // deprecated
+        log_event(ServerEvent::Session(self.session_desc.clone()));
     }
 }
 

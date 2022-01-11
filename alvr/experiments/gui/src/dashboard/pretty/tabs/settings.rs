@@ -1,14 +1,18 @@
 use std::collections::HashMap;
 
 use crate::dashboard::{
-    pretty::{tabs::InitData, theme::ButtonStyle},
+    pretty::{
+        tabs::InitData,
+        theme::{ButtonStyle, ScrollableStyle},
+    },
     RequestHandler,
 };
 
-use super::{SettingControl, SettingControlEvent, SettingControlEventType, UpdatingData};
+use super::{
+    DrawingData, SettingControl, SettingControlEvent, SettingControlEventType, UpdatingData,
+};
 use alvr_session::SessionDesc;
-use iced::{scrollable, Button, Column, Element, Length, Row, Scrollable, Space, Text};
-use iced_native::button;
+use iced::{button, scrollable, Button, Column, Element, Length, Row, Scrollable, Space, Text};
 use serde_json as json;
 use settings_schema::SchemaNode;
 
@@ -26,8 +30,6 @@ pub struct TabLabel {
     label_state: button::State,
 }
 
-// Note: all child and descendant controls are stored in a flat vector. This allows simpler
-// management of events.
 pub struct TabContent {
     name: String,
     scroll_state: scrollable::State,
@@ -44,13 +46,13 @@ pub struct SettingsPanel {
 }
 
 impl SettingsPanel {
-    pub fn new(request_handler: &mut RequestHandler) -> Self {
+    pub fn new() -> Self {
         let schema = alvr_session::settings_schema(alvr_session::session_settings_default());
         let (tabs_labels, tabs_content);
         if let SchemaNode::Section { entries } = schema {
             tabs_labels = entries
                 .iter()
-                .map(|(name, maybe_data)| TabLabel {
+                .map(|(name, _)| TabLabel {
                     name: name.clone(),
                     display_name: name.clone(),
                     label_state: button::State::new(),
@@ -130,7 +132,7 @@ impl SettingsPanel {
                     path: event.path,
                     event: event.event_type,
                     request_handler,
-                    string_path: format!("session.session_settings.{}", tab.name),
+                    string_path: format!("session.sessionSettings.{}", tab.name),
                 })
             }
         }
@@ -165,17 +167,26 @@ impl SettingsPanel {
                         })
                         .on_press(SettingsEvent::AdvancedClick),
                 )
-                .padding(5)
+                .padding([5, 15])
                 .spacing(5),
             )
             .push({
                 let active_tab = &mut self.tabs_content[self.selected_tab];
 
-                // let label_elements = active_tab.content.label_elements(self.advanced);
-                // let control_elements = active_tab.content.control_elements(self.advanced);
+                let result = active_tab.control.view(&DrawingData {
+                    advanced: self.advanced,
+                    common_trans: (),
+                });
 
-                Scrollable::new(&mut active_tab.scroll_state) // .push(Column::new().push(label_elements))
-                                                              // .push(Column::new().push(control_elements))
+                Scrollable::new(&mut active_tab.scroll_state)
+                    .push(
+                        Row::new()
+                            .push(result.left.map(SettingsEvent::FromControl))
+                            .push(result.right.map(SettingsEvent::FromControl))
+                            .spacing(15),
+                    )
+                    .padding([0, 15, 30, 15])
+                    .style(ScrollableStyle)
             })
             .into()
     }

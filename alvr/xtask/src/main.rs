@@ -6,7 +6,7 @@ mod version;
 use alvr_filesystem::{self as afs, Layout};
 use fs_extra::{self as fsx, dir as dirx};
 use pico_args::Arguments;
-use std::{env, fs, path::Path, time::Instant};
+use std::{env, fs, time::Instant};
 
 const HELP_STR: &str = r#"
 cargo xtask
@@ -53,7 +53,7 @@ pub fn remove_build_dir() {
 
 pub fn build_server(
     is_release: bool,
-    experiements: bool,
+    experiments: bool,
     fetch_crates: bool,
     bundle_ffmpeg: bool,
     root: Option<String>,
@@ -80,6 +80,10 @@ pub fn build_server(
     if bundle_ffmpeg {
         server_features.push("bundled_ffmpeg");
     }
+    if experiments {
+        server_features.push("new-dashboard")
+    }
+
     if server_features.is_empty() {
         server_features.push("default")
     }
@@ -106,11 +110,11 @@ pub fn build_server(
     let mut copy_options = dirx::CopyOptions::new();
     copy_options.copy_inside = true;
     fsx::copy_items(
-        &["alvr/xtask/resources/presets"],
+        &[afs::workspace_dir().join("alvr/xtask/resources/presets")],
         layout.presets_dir(),
         &copy_options,
     )
-    .expect("copy presets");
+    .unwrap();
 
     if bundle_ffmpeg {
         let ffmpeg_path = dependencies::build_ffmpeg_linux();
@@ -140,22 +144,21 @@ pub fn build_server(
         .unwrap();
     }
 
-    if cfg!(not(target_os = "macos")) {
-        command::run_in(
-            &afs::workspace_dir().join("alvr/server"),
-            &format!(
-                "cargo build {} --no-default-features --features {}",
-                build_flags,
-                server_features.join(",")
-            ),
-        )
-        .unwrap();
-        fs::copy(
-            artifacts_dir.join(afs::dynlib_fname("alvr_server")),
-            layout.openvr_driver_lib(),
-        )
-        .unwrap();
-    }
+    command::run_in(
+        &afs::workspace_dir().join("alvr/server"),
+        &format!(
+            "cargo build {} --no-default-features --features {}",
+            build_flags,
+            server_features.join(",")
+        ),
+    )
+    .unwrap();
+    fs::copy(
+        artifacts_dir.join(afs::dynlib_fname("alvr_server")),
+        layout.openvr_driver_lib(),
+    )
+    .unwrap();
+
     command::run_in(
         &afs::workspace_dir().join("alvr/launcher"),
         &format!(
@@ -170,9 +173,10 @@ pub fn build_server(
         layout.launcher_exe(),
     )
     .unwrap();
-    if experiements {
+
+    if experiments {
         let dir_content = dirx::get_dir_content2(
-            "alvr/experiments/gui/languages",
+            "alvr/experiments/gui/resources/languages",
             &dirx::DirOptions { depth: 1 },
         )
         .unwrap();
@@ -184,24 +188,13 @@ pub fn build_server(
         let destination = afs::server_build_dir().join("languages");
         fs::create_dir_all(&destination).unwrap();
         fsx::copy_items(&items, destination, &dirx::CopyOptions::new()).unwrap();
-
-        command::run_in(
-            &afs::workspace_dir().join("alvr/experiments/egui_dashboard"),
-            &format!("cargo build {}", build_flags),
-        )
-        .unwrap();
-        fs::copy(
-            artifacts_dir.join(afs::exec_fname("alvr_egui_dashboard")),
-            afs::server_build_dir().join(afs::exec_fname("alvr_egui_dashboard")),
-        )
-        .unwrap();
     }
 
     fs::copy(
-        Path::new("alvr/xtask/resources/driver.vrdrivermanifest"),
+        afs::workspace_dir().join("alvr/xtask/resources/driver.vrdrivermanifest"),
         layout.openvr_driver_manifest(),
     )
-    .expect("copy openVR driver manifest");
+    .unwrap();
 
     if cfg!(windows) {
         let dir_content = dirx::get_dir_content("alvr/server/cpp/bin/windows").unwrap();
@@ -213,18 +206,20 @@ pub fn build_server(
         .unwrap();
     }
 
-    let dir_content =
-        dirx::get_dir_content2("alvr/resources", &dirx::DirOptions { depth: 1 }).unwrap();
-    let items: Vec<&String> = dir_content.directories[1..]
-        .iter()
-        .chain(dir_content.files.iter())
-        .collect();
+    // let dir_content =
+    //     dirx::get_dir_content2("alvr/resources", &dirx::DirOptions { depth: 1 }).unwrap();
+    // let items: Vec<&String> = dir_content.directories[1..]
+    //     .iter()
+    //     .chain(dir_content.files.iter())
+    //     .collect();
+    // fs::create_dir_all(&layout.resources_dir()).unwrap();
+    // fsx::copy_items(&items, layout.resources_dir(), &dirx::CopyOptions::new()).unwrap();
 
-    fs::create_dir_all(&layout.resources_dir()).unwrap();
-    fsx::copy_items(&items, layout.resources_dir(), &dirx::CopyOptions::new()).unwrap();
-
-    let dir_content =
-        dirx::get_dir_content2("alvr/dashboard", &dirx::DirOptions { depth: 1 }).unwrap();
+    let dir_content = dirx::get_dir_content2(
+        afs::workspace_dir().join("alvr/dashboard"),
+        &dirx::DirOptions { depth: 1 },
+    )
+    .unwrap();
     let items: Vec<&String> = dir_content.directories[1..]
         .iter()
         .chain(dir_content.files.iter())
@@ -413,5 +408,11 @@ fn main() {
         return;
     }
 
-    println!("\nDone (in {:?})\n", Instant::now() - begin_time);
+    let elapsed_time = Instant::now() - begin_time;
+
+    println!(
+        "\nDone [{}m {}s]\n",
+        elapsed_time.as_secs() / 60,
+        elapsed_time.as_secs() % 60
+    );
 }

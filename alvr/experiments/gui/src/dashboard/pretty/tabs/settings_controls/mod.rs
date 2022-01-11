@@ -13,29 +13,29 @@ pub mod text;
 pub mod vector;
 
 use crate::dashboard::RequestHandler;
-use iced::Element;
+use iced::{Column, Element, Length, Row, Space};
 use serde_json as json;
 use settings_schema::SchemaNode;
-use std::collections::HashMap;
 
+const ROW_HEIGHT_UNITS: u16 = 30;
+const ROW_HEIGHT: Length = Length::Units(ROW_HEIGHT_UNITS);
+const INDENTATION: Length = Length::Units(10);
+
+#[derive(PartialEq)]
 enum ShowMode {
     Basic,
     Advanced,
     Always,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SettingControlEventType {
     SessionUpdated(json::Value),
     ResetClick,
     Click,                         // For HOS/Action
-    VariantClick(String),          // For Choice, HOS/Choice
+    VariantClick(usize),           // For Choice, HOS/Choice
     Toggle,                        // For Optional, Switch, Boolean, HOS/Boolean
-    IntegerChanged(i128),          // For Integer, Float (slider)
-    FloatChanged(i64),             // For Integer, Float (slider)
-    Increase,                      // For Integer, Float (numeric up-down)
-    Decrease,                      // For Integer, Float (numeric up-down)
-    TextChanged(String),           // For Integer, Float, Text
+    TempValueChanged(String),      // For Integer, Float, Text
     ApplyValue,                    // For Integer, Float, Text
     AddRow,                        // For Vector, Dictionary
     RemoveRow(usize),              // For Vector, Dictionary
@@ -76,13 +76,19 @@ pub struct DrawingData {
     pub common_trans: (), // todo
 }
 
+pub struct DrawingResult<'a> {
+    pub inline: Option<Element<'a, SettingControlEvent>>, // usually at the right of a label of the parent
+    pub left: Element<'a, SettingControlEvent>,           // usually a label, on a new line
+    pub right: Element<'a, SettingControlEvent>, // control at the right of the left control
+}
+
 pub enum SettingControl {
     Section(Box<section::Control>),
     Choice(Box<choice::Control>),
     Optional(Box<optional::Control>),
     Switch(Box<switch::Control>),
     Boolean(boolean::Control),
-    Integer(numeric::Control<i128>),
+    Integer(numeric::Control<i32>), // Cannot use i128. I need From<f64> for Slider
     Float(numeric::Control<f64>),
     Text(text::Control),
     Array(Box<array::Control>),
@@ -134,7 +140,13 @@ impl SettingControl {
                 step,
                 gui,
             } => SettingControl::Integer(numeric::Control::new(InitData {
-                schema: (default, min, max, step, gui),
+                schema: (
+                    default as _,
+                    min.map(|v| v as i32),
+                    max.map(|v| v as i32),
+                    step.map(|v| v as i32),
+                    gui,
+                ),
                 trans,
             })),
             SchemaNode::Float {
@@ -172,30 +184,69 @@ impl SettingControl {
     pub fn update(&mut self, data: UpdatingData) {
         match self {
             SettingControl::Section(control) => control.update(data),
-            SettingControl::Choice(control) => (),
-            SettingControl::Optional(control) => (),
-            SettingControl::Switch(control) => (),
-            SettingControl::Boolean(control) => (),
-            SettingControl::Integer(control) => (),
-            SettingControl::Float(control) => (),
-            SettingControl::Text(control) => (),
-            SettingControl::Array(control) => (),
-            SettingControl::Vector(control) => (),
-            SettingControl::Dictionary(control) => (),
-            SettingControl::HigherOrder(control) => (),
-            SettingControl::AudioDropdown(control) => (),
+            SettingControl::Choice(control) => control.update(data),
+            SettingControl::Optional(_) => (),
+            SettingControl::Switch(control) => control.update(data),
+            SettingControl::Boolean(control) => control.update(data),
+            SettingControl::Integer(control) => control.update(data),
+            SettingControl::Float(control) => control.update(data),
+            SettingControl::Text(control) => control.update(data),
+            SettingControl::Array(control) => control.update(data),
+            SettingControl::Vector(_) => (),
+            SettingControl::Dictionary(_) => (),
+            SettingControl::HigherOrder(_) => (),
+            SettingControl::AudioDropdown(_) => (),
         }
     }
 
-    pub fn inline_element(&mut self, data: DrawingData) -> Element<SettingControlEvent> {
-        todo!()
+    pub fn view(&mut self, data: &DrawingData) -> DrawingResult {
+        match self {
+            SettingControl::Section(control) => control.view(data),
+            SettingControl::Choice(control) => control.view(data),
+            SettingControl::Optional(_) => todo!(),
+            SettingControl::Switch(control) => control.view(data),
+            SettingControl::Boolean(control) => control.view(data),
+            SettingControl::Integer(control) => control.view(),
+            SettingControl::Float(control) => control.view(),
+            SettingControl::Text(control) => control.view(data),
+            SettingControl::Array(control) => control.view(data),
+            SettingControl::Vector(_) => todo!(),
+            SettingControl::Dictionary(_) => todo!(),
+            SettingControl::HigherOrder(control) => control.view(data),
+            SettingControl::AudioDropdown(_) => todo!(),
+        }
+    }
+}
+
+// For all containers except Section (which needs to handle the labels and notices)
+fn draw_result(
+    result: DrawingResult,
+) -> (Element<SettingControlEvent>, Element<SettingControlEvent>) {
+    let mut left_control = Column::new();
+    let mut right_control = Column::new();
+
+    if let Some(inline) = result.inline {
+        left_control = left_control.push(Space::with_height(ROW_HEIGHT));
+        right_control = right_control.push(inline);
     }
 
-    pub fn label_elements(&mut self, data: DrawingData) -> Vec<Element<SettingControlEvent>> {
-        todo!()
-    }
+    let left_control: Element<_> = left_control
+        .push(
+            Row::new()
+                .push(Space::with_width(INDENTATION))
+                .push(result.left),
+        )
+        .into();
+    let right_control: Element<_> = right_control.push(result.right).into();
 
-    pub fn control_elements(&mut self, data: DrawingData) -> Vec<Element<SettingControlEvent>> {
-        todo!()
-    }
+    (
+        left_control.map(|mut e: SettingControlEvent| {
+            e.path.push(0);
+            e
+        }),
+        right_control.map(|mut e: SettingControlEvent| {
+            e.path.push(0);
+            e
+        }),
+    )
 }

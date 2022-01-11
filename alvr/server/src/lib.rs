@@ -1,5 +1,6 @@
 mod connection;
 mod connection_utils;
+mod dashboard;
 mod graphics_info;
 mod logging_backend;
 mod openvr;
@@ -11,15 +12,14 @@ mod bindings {
 }
 use bindings::*;
 
-use alvr_common::prelude::*;
+use alvr_common::{lazy_static, log, prelude::*, Haptics, TrackedDeviceType};
 use alvr_filesystem::{self as afs, Layout};
-use alvr_session::{ClientConnectionDesc, SessionManager};
-use lazy_static::lazy_static;
+use alvr_session::{ClientConnectionDesc, ServerEvent, SessionManager};
+use alvr_sockets::{TimeSyncPacket, VideoFrameHeaderPacket};
 use parking_lot::Mutex;
 use std::{
     collections::{hash_map::Entry, HashSet},
     ffi::{c_void, CStr, CString},
-    fs,
     net::IpAddr,
     os::raw::c_char,
     ptr,
@@ -41,11 +41,18 @@ lazy_static! {
         afs::filesystem_layout_from_openvr_driver_root_dir(&alvr_commands::get_driver_dir().unwrap());
     static ref SESSION_MANAGER: Mutex<SessionManager> =
         Mutex::new(SessionManager::new(&FILESYSTEM_LAYOUT.session()));
-    static ref MAYBE_RUNTIME: Mutex<Option<Runtime>> = Mutex::new(Runtime::new().ok());
-    static ref CLIENTS_UPDATED_NOTIFIER: Notify = Notify::new();
+    static ref RUNTIME: Mutex<Option<Runtime>> = Mutex::new(Runtime::new().ok());
     static ref MAYBE_WINDOW: Mutex<Option<Arc<alcro::UI>>> = Mutex::new(None);
-    static ref MAYBE_LEGACY_SENDER: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>> =
+    // static ref MAYBE_NEW_DASHBOARD: Mutex<Option<Arc<alvr_gui::Dashboard>>> = Mutex::new(None);
+
+    static ref VIDEO_SENDER: Mutex<Option<mpsc::UnboundedSender<(VideoFrameHeaderPacket, Vec<u8>)>>> =
         Mutex::new(None);
+    static ref HAPTICS_SENDER: Mutex<Option<mpsc::UnboundedSender<Haptics<TrackedDeviceType>>>> =
+        Mutex::new(None);
+    static ref TIME_SYNC_SENDER: Mutex<Option<mpsc::UnboundedSender<TimeSyncPacket>>> =
+        Mutex::new(None);
+
+    static ref CLIENTS_UPDATED_NOTIFIER: Notify = Notify::new();
     static ref RESTART_NOTIFIER: Notify = Notify::new();
     static ref SHUTDOWN_NOTIFIER: Notify = Notify::new();
 
@@ -62,13 +69,15 @@ lazy_static! {
 }
 
 pub fn shutdown_runtime() {
+    alvr_session::log_event(ServerEvent::ServerQuitting);
+
     if let Some(window) = MAYBE_WINDOW.lock().take() {
         window.close();
     }
 
     SHUTDOWN_NOTIFIER.notify_waiters();
 
-    if let Some(runtime) = MAYBE_RUNTIME.lock().take() {
+    if let Some(runtime) = RUNTIME.lock().take() {
         runtime.shutdown_background();
         // shutdown_background() is non blocking and it does not guarantee that every internal
         // thread is terminated in a timely manner. Using shutdown_background() instead of just
@@ -108,7 +117,7 @@ pub enum ClientListAction {
     RemoveIpOrEntry(Option<IpAddr>),
 }
 
-pub async fn update_client_list(hostname: String, action: ClientListAction) {
+pub fn update_client_list(hostname: String, action: ClientListAction) {
     let mut client_connections = SESSION_MANAGER.lock().get().client_connections.clone();
 
     let maybe_client_entry = client_connections.entry(hostname);
@@ -159,55 +168,12 @@ pub async fn update_client_list(hostname: String, action: ClientListAction) {
     }
 }
 
-// this thread gets interrupted when SteamVR closes
-// todo: handle this in a better way
-fn ui_thread() -> StrResult {
-    const WINDOW_WIDTH: u32 = 800;
-    const WINDOW_HEIGHT: u32 = 600;
-
-    let (pos_left, pos_top) =
-        if let Ok((screen_width, screen_height)) = graphics_info::get_screen_size() {
-            (
-                (screen_width - WINDOW_WIDTH) / 2,
-                (screen_height - WINDOW_HEIGHT) / 2,
-            )
-        } else {
-            (0, 0)
-        };
-
-    let _tmpdir = trace_err!(tempfile::TempDir::new());
-    let path = _tmpdir.as_ref().unwrap().path();
-    let _file = trace_err!(fs::File::create(path.join("FirstLaunchAfterInstallation")))?;
-
-    let window = Arc::new(trace_err!(alcro::UIBuilder::new()
-        .content(alcro::Content::Url("http://127.0.0.1:8082"))
-        .user_data_dir(path)
-        .size(WINDOW_WIDTH as _, WINDOW_HEIGHT as _)
-        .custom_args(&[
-            "--disk-cache-size=1",
-            &format!("--window-position={},{}", pos_left, pos_top)
-        ])
-        .run())?);
-
-    *MAYBE_WINDOW.lock() = Some(Arc::clone(&window));
-
-    window.wait_finish();
-
-    // prevent panic on window.close()
-    *MAYBE_WINDOW.lock() = None;
-    shutdown_runtime();
-
-    unsafe { ShutdownSteamvr() };
-
-    Ok(())
-}
-
 fn init() {
     let (log_sender, _) = broadcast::channel(web_server::WS_BROADCAST_CAPACITY);
     let (events_sender, _) = broadcast::channel(web_server::WS_BROADCAST_CAPACITY);
     logging_backend::init_logging(log_sender.clone(), events_sender.clone());
 
-    if let Some(runtime) = MAYBE_RUNTIME.lock().as_mut() {
+    if let Some(runtime) = RUNTIME.lock().as_mut() {
         // Acquire and drop the session_manager lock to create session.json if not present
         // this is needed until Settings.cpp is replaced with Rust. todo: remove
         SESSION_MANAGER.lock().get_mut();
@@ -216,20 +182,25 @@ fn init() {
             let connections = SESSION_MANAGER.lock().get().client_connections.clone();
             for (hostname, connection) in connections {
                 if !connection.trusted {
-                    update_client_list(hostname, ClientListAction::RemoveIpOrEntry(None)).await;
+                    update_client_list(hostname, ClientListAction::RemoveIpOrEntry(None));
                 }
             }
 
-            let web_server =
-                alvr_common::show_err_async(web_server::web_server(log_sender, events_sender));
+            let web_server = alvr_common::show_err_async(web_server::web_server(
+                log_sender,
+                events_sender.clone(),
+            ));
+
+            let dashboard_event_handler = dashboard::event_listener(events_sender);
 
             tokio::select! {
                 _ = web_server => (),
+                _ = dashboard_event_handler => (),
                 _ = SHUTDOWN_NOTIFIER.notified() => (),
             }
         });
 
-        thread::spawn(|| alvr_common::show_err(ui_thread()));
+        thread::spawn(|| alvr_common::show_err(dashboard::ui_thread()));
     }
 
     unsafe {
@@ -287,8 +258,18 @@ pub unsafe extern "C" fn HmdDriverFactory(
         log(log::Level::Debug, string_ptr);
     }
 
-    extern "C" fn legacy_send(buffer_ptr: *mut u8, len: i32) {
-        if let Some(sender) = &*MAYBE_LEGACY_SENDER.lock() {
+    extern "C" fn video_send(header: VideoFrame, buffer_ptr: *mut u8, len: i32) {
+        if let Some(sender) = &*VIDEO_SENDER.lock() {
+            let header = VideoFrameHeaderPacket {
+                packet_counter: header.packetCounter,
+                tracking_frame_index: header.trackingFrameIndex,
+                video_frame_index: header.videoFrameIndex,
+                sent_time: header.sentTime,
+                frame_byte_size: header.frameByteSize,
+                fec_index: header.fecIndex,
+                fec_percentage: header.fecPercentage,
+            };
+
             let mut vec_buffer = vec![0; len as _];
 
             // use copy_nonoverlapping (aka memcpy) to avoid freeing memory allocated by C++
@@ -296,7 +277,48 @@ pub unsafe extern "C" fn HmdDriverFactory(
                 ptr::copy_nonoverlapping(buffer_ptr, vec_buffer.as_mut_ptr(), len as _);
             }
 
-            sender.send(vec_buffer).ok();
+            sender.send((header, vec_buffer)).ok();
+        }
+    }
+
+    extern "C" fn haptics_send(haptics: HapticsFeedback) {
+        if let Some(sender) = &*HAPTICS_SENDER.lock() {
+            let haptics = Haptics {
+                device: if haptics.hand == 0 {
+                    TrackedDeviceType::LeftHand
+                } else {
+                    TrackedDeviceType::RightHand
+                },
+                duration: Duration::from_secs_f32(haptics.duration),
+                frequency: haptics.frequency,
+                amplitude: haptics.amplitude,
+            };
+
+            sender.send(haptics).ok();
+        }
+    }
+
+    extern "C" fn time_sync_send(data: TimeSync) {
+        if let Some(sender) = &*TIME_SYNC_SENDER.lock() {
+            let time_sync = TimeSyncPacket {
+                mode: data.mode,
+                server_time: data.serverTime,
+                client_time: data.clientTime,
+                packets_lost_total: data.packetsLostTotal,
+                packets_lost_in_second: data.packetsLostInSecond,
+                average_send_latency: data.averageSendLatency,
+                average_transport_latency: data.averageTransportLatency,
+                average_decode_latency: data.averageDecodeLatency,
+                idle_time: data.idleTime,
+                fec_failure: data.fecFailure,
+                fec_failure_in_second: data.fecFailureInSecond,
+                fec_failure_total: data.fecFailureTotal,
+                fps: data.fps,
+                server_total_latency: data.serverTotalLatency,
+                tracking_recv_frame_index: data.trackingRecvFrameIndex,
+            };
+
+            sender.send(time_sync).ok();
         }
     }
 
@@ -305,7 +327,7 @@ pub unsafe extern "C" fn HmdDriverFactory(
             FILESYSTEM_LAYOUT.openvr_driver_root_dir.clone(),
         ));
 
-        if let Some(runtime) = &mut *MAYBE_RUNTIME.lock() {
+        if let Some(runtime) = &mut *RUNTIME.lock() {
             runtime.spawn(async move {
                 if set_default_chap {
                     // call this when inside a new tokio thread. Calling this on the parent thread will
@@ -329,14 +351,16 @@ pub unsafe extern "C" fn HmdDriverFactory(
     LogInfo = Some(log_info);
     LogDebug = Some(log_debug);
     DriverReadyIdle = Some(driver_ready_idle);
-    LegacySend = Some(legacy_send);
+    VideoSend = Some(video_send);
+    HapticsSend = Some(haptics_send);
+    TimeSyncSend = Some(time_sync_send);
     ShutdownRuntime = Some(_shutdown_runtime);
 
     // cast to usize to allow the variables to cross thread boundaries
     let interface_name_usize = interface_name as usize;
     let return_code_usize = return_code as usize;
 
-    lazy_static::lazy_static! {
+    lazy_static! {
         static ref MAYBE_PTR_USIZE: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
         static ref NUM_TRIALS: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
     }

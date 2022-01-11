@@ -1,253 +1,254 @@
-mod graphics;
+mod connection;
+mod scene;
+mod storage;
+mod streaming_compositor;
 mod video_decoder;
+mod xr;
 
-use alvr_common::prelude::*;
-use alvr_graphics::{
-    convert::{
-        self, SwapchainCreateData, SwapchainCreateInfo, DEVICE_FEATURES, TARGET_VULKAN_VERSION,
-    },
-    Context,
+use crate::xr::{XrContext, XrEvent, XrPresentationGuard, XrSession};
+use alvr_common::{
+    glam::{Quat, UVec2, Vec3},
+    log,
+    prelude::*,
+    Fov,
 };
-use ash::vk::{self, Handle};
-use openxr as xr;
-use std::{ffi::CString, mem, sync::Arc};
-use wgpu::{Device, TextureDimension, TextureFormat, TextureView, TextureViewDescriptor};
-use wgpu_hal as hal;
+use alvr_graphics::{wgpu::Texture, GraphicsContext};
+use alvr_session::{CodecType, TrackingSpace};
+use alvr_sockets::VideoFrameHeaderPacket;
+use connection::VideoStreamingComponents;
+use parking_lot::{Mutex, RwLock};
+use scene::Scene;
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::Duration,
+};
+use streaming_compositor::StreamingCompositor;
+use tokio::{
+    runtime::{self, Runtime},
+    sync::Notify,
+};
 
-struct Swapchain {
-    handle: Arc<xr::Swapchain<xr::Vulkan>>,
-    views: Vec<TextureView>,
-}
+const MAX_RENDERING_LOOP_FAILS: usize = 5;
 
-fn create_swapchain(
-    device: &Device,
-    session: &xr::Session<xr::Vulkan>,
-    size: (u32, u32),
-) -> Swapchain {
-    const FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
-    const USAGE: xr::SwapchainUsageFlags = xr::SwapchainUsageFlags::COLOR_ATTACHMENT;
+// Timeout stream after this portion of frame interval. must be less than 1, so Phase Sync can
+// compensate for it.
+const FRAME_TIMEOUT_MULTIPLIER: f32 = 0.9;
 
-    let swapchain = Arc::new(
-        session
-            .create_swapchain(&xr::SwapchainCreateInfo {
-                create_flags: xr::SwapchainCreateFlags::EMPTY,
-                usage_flags: USAGE,
-                format: FORMAT.as_raw() as _,
-                sample_count: 1,
-                width: size.0,
-                height: size.1,
-                face_count: 1,
-                array_size: 1,
-                mip_count: 1,
-            })
-            .unwrap(),
-    );
-
-    let textures = convert::create_texture_set(
-        device,
-        SwapchainCreateData::External {
-            images: swapchain
-                .enumerate_images()
-                .unwrap()
-                .iter()
-                .map(|raw_image| vk::Image::from_raw(*raw_image))
-                .collect(),
-            vk_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
-            vk_format: FORMAT,
-            hal_usage: hal::TextureUses::COLOR_TARGET,
-            drop_guard: Some(Arc::clone(&swapchain) as _),
-        },
-        SwapchainCreateInfo {
-            usage: USAGE,
-            format: TextureFormat::Rgba8UnormSrgb,
-            sample_count: 1,
-            width: size.0,
-            height: size.1,
-            texture_type: convert::TextureType::Flat { array_size: 1 },
-            mip_count: 1,
-        },
-    );
-
-    Swapchain {
-        handle: swapchain,
-        views: textures
-            .iter()
-            .map(|tex| {
-                tex.create_view(&TextureViewDescriptor {
-                    base_array_layer: 0,
-                    ..Default::default()
-                })
-            })
-            .collect(),
-    }
-}
-
-pub fn create_context_and_session(
-    xr_instance: &xr::Instance,
-    system: xr::SystemId,
-) -> StrResult<(
-    Context,
-    xr::Session<xr::Vulkan>,
-    xr::FrameWaiter,
-    xr::FrameStream<xr::Vulkan>,
-)> {
-    // this call is required by spec
-    let reqs = xr_instance
-        .graphics_requirements::<xr::Vulkan>(system)
-        .unwrap();
-
-    // Oculus Go requires baseline Vulkan v1.0.0
-    if reqs.min_api_version_supported > xr::Version::new(1, 0, 0) {
-        return fmt_e!("Incompatible vulkan version");
-    }
-
-    let vk_entry = unsafe { ash::Entry::new().unwrap() };
-
-    let vk_instance = unsafe {
-        let extensions_ptrs =
-            convert::get_vulkan_instance_extensions(&vk_entry, TARGET_VULKAN_VERSION)?
-                .iter()
-                .map(|x| x.as_ptr())
-                .collect::<Vec<_>>();
-        let raw_instance = trace_err!(trace_err!(xr_instance.create_vulkan_instance(
-            system,
-            mem::transmute(vk_entry.static_fn().get_instance_proc_addr),
-            &vk::InstanceCreateInfo::builder()
-                .application_info(
-                    &vk::ApplicationInfo::builder().api_version(TARGET_VULKAN_VERSION),
-                )
-                .enabled_extension_names(&extensions_ptrs) as *const _ as *const _,
-        ))?)?;
-        ash::Instance::load(
-            vk_entry.static_fn(),
-            vk::Instance::from_raw(raw_instance as _),
-        )
-    };
-
-    let vk_physical_device = vk::PhysicalDevice::from_raw(trace_err!(
-        xr_instance.vulkan_graphics_device(system, vk_instance.handle().as_raw() as _)
-    )? as _);
-
-    let queue_family_index = unsafe {
-        vk_instance
-            .get_physical_device_queue_family_properties(vk_physical_device)
-            .into_iter()
-            .enumerate()
-            .find_map(|(queue_family_index, info)| {
-                if info.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
-                    Some(queue_family_index as u32)
-                } else {
-                    None
-                }
-            })
-            .unwrap()
-    };
-    let queue_index = 0;
-
-    let vk_device = unsafe {
-        let temp_adapter = convert::get_temporary_hal_adapter(
-            vk_entry.clone(),
-            TARGET_VULKAN_VERSION,
-            vk_instance.clone(),
-            vk_physical_device,
-        )?;
-        let extensions = temp_adapter.required_device_extensions(DEVICE_FEATURES);
-        let mut features = temp_adapter.physical_device_features(&extensions, DEVICE_FEATURES);
-
-        let queue_infos = [vk::DeviceQueueCreateInfo::builder()
-            .queue_family_index(queue_family_index)
-            .queue_priorities(&[1.0])
-            .build()];
-        let extensions_ptrs = extensions.iter().map(|x| x.as_ptr()).collect::<Vec<_>>();
-        let info = vk::DeviceCreateInfo::builder()
-            .queue_create_infos(&queue_infos)
-            .enabled_extension_names(&extensions_ptrs);
-        let info = features.add_to_device_create_builder(info);
-
-        let raw_device = trace_err!(trace_err!(xr_instance.create_vulkan_device(
-            system,
-            mem::transmute(vk_entry.static_fn().get_instance_proc_addr),
-            vk_physical_device.as_raw() as _,
-            &info as *const _ as *const _,
-        ))?)?;
-        ash::Device::load(vk_instance.fp_v1_0(), vk::Device::from_raw(raw_device as _))
-    };
-
-    let (session, mut frame_wait, mut frame_stream) = unsafe {
-        trace_err!(xr_instance.create_session::<xr::Vulkan>(
-            system,
-            &xr::vulkan::SessionCreateInfo {
-                instance: vk_instance.handle().as_raw() as _,
-                physical_device: vk_physical_device.as_raw() as _,
-                device: vk_device.handle().as_raw() as _,
-                queue_family_index,
-                queue_index: 0,
-            },
-        ))?
-    };
-
-    Ok((
-        Context::from_vulkan(
-            true,
-            vk_entry,
-            TARGET_VULKAN_VERSION,
-            vk_instance,
-            vk_physical_device,
-            vk_device,
-            queue_family_index,
-            queue_index,
-        )?,
-        session,
-        frame_wait,
-        frame_stream,
-    ))
-}
-
-pub fn run() -> StrResult {
-    let entry = xr::Entry::load().unwrap();
-
-    #[cfg(target_os = "android")]
-    entry.initialize_android_loader().unwrap();
-
-    let available_extensions = entry.enumerate_extensions().unwrap();
-
-    let mut enabled_extensions = xr::ExtensionSet::default();
-    enabled_extensions.khr_vulkan_enable2 = true;
-    #[cfg(target_os = "android")]
-    {
-        enabled_extensions.khr_android_create_instance = true;
-    }
-    let xr_instance = entry
-        .create_instance(
-            &xr::ApplicationInfo {
-                application_name: "ALVR client",
-                application_version: 0,
-                engine_name: "ALVR",
-                engine_version: 0,
-            },
-            &enabled_extensions,
-            &[],
-        )
-        .unwrap();
-
-    let system = xr_instance
-        .system(xr::FormFactor::HEAD_MOUNTED_DISPLAY)
-        .unwrap();
-
-    let environment_blend_mode = xr_instance
-        .enumerate_environment_blend_modes(system, xr::ViewConfigurationType::PRIMARY_STEREO)
-        .unwrap()[0];
-
-    let (context, session, frame_wait, frame_stream) =
-        create_context_and_session(&xr_instance, system)?;
-
-    todo!()
+#[derive(Clone)]
+pub struct ViewConfig {
+    orientation: Quat,
+    position: Vec3,
+    fov: Fov,
 }
 
 #[cfg_attr(target_os = "android", ndk_glue::main)]
 pub fn main() {
+    env_logger::init();
+    log::error!("enter main");
+
     show_err(run());
 
     #[cfg(target_os = "android")]
     ndk_glue::native_activity().finish();
+}
+
+fn run() -> StrResult {
+    let xr_context = Arc::new(XrContext::new());
+
+    let graphics_context = Arc::new(xr::create_graphics_context(&xr_context)?);
+
+    let mut scene = Scene::new(Arc::clone(&graphics_context))?;
+
+    let xr_session = XrSession::new(
+        Arc::clone(&xr_context),
+        Arc::clone(&graphics_context),
+        UVec2::new(1, 1),
+        &[],
+        vec![],
+        openxr::EnvironmentBlendMode::OPAQUE,
+    )?;
+    let xr_session = Arc::new(RwLock::new(Some(xr_session)));
+
+    let video_streaming_components = Arc::new(Mutex::new(None));
+
+    let standby_status = Arc::new(AtomicBool::new(true));
+    let idr_request_notifier = Arc::new(Notify::new());
+
+    let runtime = trace_err!(Runtime::new())?;
+    runtime.spawn(connection::connection_lifecycle_loop(
+        xr_context,
+        graphics_context,
+        Arc::clone(&xr_session),
+        Arc::clone(&video_streaming_components),
+        Arc::clone(&standby_status),
+        Arc::clone(&idr_request_notifier),
+    ));
+
+    let mut fails_count = 0;
+    loop {
+        let res = show_err(rendering_loop(
+            &mut scene,
+            Arc::clone(&xr_session),
+            Arc::clone(&video_streaming_components),
+            Arc::clone(&standby_status),
+            Arc::clone(&idr_request_notifier),
+        ));
+
+        if res.is_some() {
+            break Ok(());
+        } else {
+            thread::sleep(Duration::from_millis(500));
+
+            fails_count += 1;
+
+            if fails_count == MAX_RENDERING_LOOP_FAILS {
+                log::error!("Rendering loop failed {} times. Terminating.", fails_count);
+                break Ok(());
+            }
+        }
+    }
+}
+
+fn rendering_loop(
+    scene: &mut Scene,
+    xr_session: Arc<RwLock<Option<XrSession>>>,
+    video_streaming_components: Arc<Mutex<Option<VideoStreamingComponents>>>,
+    standby_status: Arc<AtomicBool>,
+    idr_request_notifier: Arc<Notify>,
+) -> StrResult {
+    // this is used to keep the last stream frame in place when the stream is stuck
+    let old_stream_view_configs = vec![];
+
+    loop {
+        let xr_session_rlock = xr_session.read();
+        let xr_session = xr_session_rlock.as_ref().unwrap();
+        let mut presentation_guard = match xr_session.begin_frame()? {
+            XrEvent::ShouldRender(guard) => {
+                if standby_status.load(Ordering::Relaxed) {
+                    idr_request_notifier.notify_one();
+                    standby_status.store(false, Ordering::Relaxed);
+                }
+
+                guard
+            }
+            XrEvent::Idle => {
+                standby_status.store(true, Ordering::Relaxed);
+                continue;
+            }
+            XrEvent::Shutdown => return Ok(()),
+        };
+
+        let maybe_stream_view_configs =
+            video_streaming_pipeline(&video_streaming_components, &mut presentation_guard);
+        presentation_guard.stream_view_configs =
+            // if let Some(stream_view_configs) = maybe_stream_view_configs.clone() {
+            //     stream_view_configs
+            // } else {
+                old_stream_view_configs.clone();
+        // };
+
+        let scene_input = xr_session.get_scene_input()?;
+
+        scene.update(
+            scene_input.left_pose_input,
+            scene_input.right_pose_input,
+            scene_input.buttons,
+            maybe_stream_view_configs.is_some(),
+            scene_input.is_focused,
+        );
+        presentation_guard.scene_view_configs = scene_input.view_configs;
+
+        for (index, acquired_swapchain) in presentation_guard
+            .acquired_scene_swapchains
+            .iter_mut()
+            .enumerate()
+        {
+            scene.render(
+                &presentation_guard.scene_view_configs[index],
+                Arc::clone(&acquired_swapchain.texture_view),
+                acquired_swapchain.size,
+            )
+        }
+    }
+}
+
+// Returns true if stream is updated for the current frame
+fn video_streaming_pipeline(
+    streaming_components: &Arc<Mutex<Option<VideoStreamingComponents>>>,
+    presentation_guard: &mut XrPresentationGuard,
+) -> Option<()> {
+    if let Some(streaming_components) = &mut *streaming_components.lock() {
+        let timeout = Duration::from_micros(
+            (presentation_guard.predicted_frame_interval.as_micros() as f32
+                * FRAME_TIMEOUT_MULTIPLIER) as _,
+        );
+        let frame_metadata = get_video_frame_data(streaming_components, timeout)?;
+
+        let compositor_target = presentation_guard
+            .acquired_stream_swapchains
+            .iter()
+            .map(|swapchain| Arc::clone(&swapchain.texture_view))
+            .collect::<Vec<_>>();
+
+        streaming_components.compositor.render(&compositor_target);
+
+        // presentation_guard.display_timestamp = frame_metadata.timestamp;
+
+        // Some(frame_metadata.view_configs)
+        Some(())
+    } else {
+        None
+    }
+}
+
+// Dequeue decoded frames and metadata and makes sure they are on the same latest timestamp
+fn get_video_frame_data(
+    streaming_components: &mut VideoStreamingComponents,
+    timeout: Duration,
+) -> Option<VideoFrameHeaderPacket> {
+    let mut frame_metadata = streaming_components
+        .frame_metadata_receiver
+        .recv_timeout(timeout)
+        .ok()?;
+
+    let mut decoder_timestamps = vec![];
+    for frame_grabber in &mut streaming_components.video_decoder_frame_grabbers {
+        let res = frame_grabber.get_output_frame(timeout);
+
+        error!("frame dequeue: {:?}", res);
+
+        decoder_timestamps.push(res.ok()?);
+    }
+
+    error!("frame decoded");
+
+    // let greatest_timestamp = decoder_timestamps
+    //     .iter()
+    //     .cloned()
+    //     .fold(frame_metadata.timestamp, Duration::max);
+
+    // while frame_metadata.timestamp < greatest_timestamp {
+    //     frame_metadata = streaming_components
+    //         .frame_metadata_receiver
+    //         .recv_timeout(timeout)
+    //         .ok()?;
+    // }
+
+    // for (mut timestamp, decoder) in decoder_timestamps
+    //     .into_iter()
+    //     .zip(streaming_components.video_decoders.iter())
+    // {
+    //     while timestamp < greatest_timestamp {
+    //         timestamp = decoder
+    //             .get_output_frame(decoder_target, 0, timeout)
+    //             .ok()
+    //             .flatten()?;
+    //     }
+    // }
+
+    Some(frame_metadata)
 }
